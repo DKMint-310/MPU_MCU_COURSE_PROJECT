@@ -144,6 +144,56 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* huart)
 
 }
 
+void HAL_I2C_MspInit(I2C_HandleTypeDef *hi2c)
+{
+  if (hi2c->Instance == I2C1)
+  {
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    gpio.Pin = GPIO_PIN_8 | GPIO_PIN_9;
+    gpio.Mode = GPIO_MODE_AF_OD;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOB, &gpio);
+
+    __HAL_AFIO_REMAP_I2C1_ENABLE();
+    __HAL_RCC_I2C1_CLK_ENABLE();
+
+    /* USER CODE BEGIN I2C1_MspInit 1 */
+    /* Preserve Serial Wire and release PB3/PB4 after the I2C remap. */
+    __HAL_AFIO_REMAP_SWJ_NOJTAG();
+    /* USER CODE END I2C1_MspInit 1 */
+  }
+}
+
+void HAL_I2C_MspDeInit(I2C_HandleTypeDef *hi2c)
+{
+  if (hi2c->Instance == I2C1)
+  {
+    __HAL_RCC_I2C1_CLK_DISABLE();
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_8 | GPIO_PIN_9);
+  }
+}
+
+void HAL_TIM_Base_MspInit(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM2)
+  {
+    __HAL_RCC_TIM2_CLK_ENABLE();
+    HAL_NVIC_SetPriority(TIM2_IRQn, 1, 0);
+    HAL_NVIC_EnableIRQ(TIM2_IRQn);
+  }
+}
+
+void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM2)
+  {
+    HAL_NVIC_DisableIRQ(TIM2_IRQn);
+    __HAL_RCC_TIM2_CLK_DISABLE();
+  }
+}
+
 /* USER CODE BEGIN 1 */
 
 /* USER CODE END 1 */
