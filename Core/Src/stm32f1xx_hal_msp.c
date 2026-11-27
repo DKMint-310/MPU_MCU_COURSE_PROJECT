@@ -73,7 +73,8 @@ void HAL_MspInit(void)
   /* System interrupt init*/
 
   /** NOJTAG: JTAG-DP Disabled and SW-DP Enabled
-  */
+   * Frees PA15, PB3 (TL1_A) and PB4 (TL2_A) while keeping Serial Wire on PA13/PA14.
+   */
   __HAL_AFIO_REMAP_SWJ_NOJTAG();
 
   /* USER CODE BEGIN MspInit 1 */
@@ -151,6 +152,7 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef *hi2c)
     GPIO_InitTypeDef gpio = {0};
 
     __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_AFIO_CLK_ENABLE();
     gpio.Pin = GPIO_PIN_8 | GPIO_PIN_9;
     gpio.Mode = GPIO_MODE_AF_OD;
     gpio.Speed = GPIO_SPEED_FREQ_HIGH;
