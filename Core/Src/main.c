@@ -30,9 +30,10 @@
 
 #if !defined(PLATFORM_FULL_INTEGRATION)
 #  if defined(__has_include)
-#    if __has_include("button.h") && __has_include("traffic_light.h") \
-        && __has_include("dht20.h") && __has_include("lcd.h") \
-        && __has_include("display.h") && __has_include("fsm_tuning.h")
+#    if __has_include("peripheral_stm32.h") && __has_include("button.h") \
+        && __has_include("traffic_light.h") && __has_include("dht20.h") \
+        && __has_include("lcd.h") && __has_include("display.h") \
+        && __has_include("fsm_tuning.h")
 #      define PLATFORM_FULL_INTEGRATION 1
 #    else
 #      define PLATFORM_FULL_INTEGRATION 0
@@ -43,11 +44,13 @@
 #endif
 
 #if PLATFORM_FULL_INTEGRATION
+#include "peripheral_stm32.h"
 #include "button.h"
 #include "traffic_light.h"
 #include "dht20.h"
 #include "lcd.h"
 #include "display.h"
+#include "fsm_tuning.h"
 void app_control_run(void);
 #endif
 /* USER CODE END Includes */
@@ -73,9 +76,7 @@ void app_control_run(void);
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
-
 TIM_HandleTypeDef htim2;
-
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
@@ -118,14 +119,82 @@ static void platform_enable_cycle_counter(void)
 }
 
 #if PLATFORM_FULL_INTEGRATION
+/*
+ * Explicit enum translation between Member 3 (global.h) and Member 2 (button.h,
+ * traffic_light.h, display.h) so differing enumerator orders cannot mismatch.
+ */
 static app_event_t platform_button_take_event(uint8_t id)
 {
-    return (app_event_t)button_take_event(id);
+    switch (button_take_event(id)) {
+    case BUTTON_PRESS: return APP_EVENT_PRESS;
+    case BUTTON_LONG:  return APP_EVENT_LONG;
+    case BUTTON_NONE:
+    default:           return APP_EVENT_NONE;
+    }
+}
+
+static light_t platform_map_light(app_light_t light)
+{
+    switch (light) {
+    case APP_GREEN: return LIGHT_GREEN;
+    case APP_AMBER: return LIGHT_AMBER;
+    case APP_RED:
+    default:        return LIGHT_RED;
+    }
 }
 
 static bool platform_traffic_apply_pair(app_light_t road1, app_light_t road2)
 {
-    return traffic_apply_pair((light_t)road1, (light_t)road2);
+    return traffic_apply_pair(platform_map_light(road1), platform_map_light(road2));
+}
+
+static display_view_t platform_read_display_view(void)
+{
+    app_snapshot_t snap = app_get_snapshot();
+    display_view_t view = {0};
+
+    switch (snap.mode) {
+    case APP_MANUAL: view.mode = DISPLAY_MANUAL; break;
+    case APP_TUNING: view.mode = DISPLAY_TUNING; break;
+    case APP_AUTO:
+    default:         view.mode = DISPLAY_AUTO;   break;
+    }
+
+    switch (snap.phase) {
+    case PHASE_P0: view.phase = DISPLAY_ROAD1_GREEN; break;
+    case PHASE_P1: view.phase = DISPLAY_ROAD1_AMBER; break;
+    case PHASE_P2: view.phase = DISPLAY_ROAD2_GREEN; break;
+    case PHASE_P3: view.phase = DISPLAY_ROAD2_AMBER; break;
+    case PHASE_ALL_RED:
+    default:       view.phase = DISPLAY_ALL_RED;     break;
+    }
+
+    view.remaining_s = (uint16_t)((snap.phase_remaining_ms + 999U) / 1000U);
+
+    switch (snap.selected) {
+    case PARAM_GREEN:
+        view.tuning_field = 'G';
+        view.tuning_value_s = snap.draft.green_s;
+        break;
+    case PARAM_AMBER:
+        view.tuning_field = 'Y';
+        view.tuning_value_s = snap.draft.amber_s;
+        break;
+    case PARAM_RED:
+    default:
+        view.tuning_field = 'R';
+        view.tuning_value_s = snap.draft.red_s;
+        break;
+    }
+
+    switch (snap.tuning_status) {
+    case TUNING_SAVED:   view.tuning_status = DISPLAY_SAVED;   break;
+    case TUNING_INVALID: view.tuning_status = DISPLAY_INVALID; break;
+    case TUNING_EDITING:
+    default:             view.tuning_status = DISPLAY_EDITING; break;
+    }
+
+    return view;
 }
 
 static const app_services_t g_app_services = {
@@ -140,8 +209,34 @@ static const app_services_t g_app_services = {
 
 static bool platform_register_tasks(void)
 {
+    static const peripheral_pin_t button_pins[BUTTON_COUNT] = {
+        {BTN_1_GPIO_Port, BTN_1_Pin},
+        {BTN_2_GPIO_Port, BTN_2_Pin},
+        {BTN_3_GPIO_Port, BTN_3_Pin},
+        {BTN_4_GPIO_Port, BTN_4_Pin}
+    };
+    /* Active-LOW buttons with internal GPIO_PULLUP (confirm in H03) */
+    static const bool button_active_high[BUTTON_COUNT] = {false, false, false, false};
+    static const peripheral_pin_t light_pins[4] = {
+        {TL1_A_GPIO_Port, TL1_A_Pin},
+        {TL1_B_GPIO_Port, TL1_B_Pin},
+        {TL2_A_GPIO_Port, TL2_A_Pin},
+        {TL2_B_GPIO_Port, TL2_B_Pin}
+    };
+    /* Default 2-bit light encoding table pending physical H02 measurement */
+    static const traffic_codes_t light_codes[2] = {
+        {.red = 3U, .amber = 1U, .green = 2U},
+        {.red = 3U, .amber = 1U, .green = 2U}
+    };
+    peripheral_i2c_t i2c_bus = peripheral_stm32_i2c(&hi2c1);
+
+    if (!peripheral_stm32_bind_buttons(button_pins, button_active_high)) return false;
+    if (!peripheral_stm32_bind_lights(light_pins, light_codes)) return false;
     traffic_all_red();
-    (void)lcd_init();
+
+    (void)dht20_init(&i2c_bus);
+    (void)lcd_configure(&i2c_bus, LCD_GROVE_ADDRESS);
+    if (!display_init(platform_read_display_view)) return false;
 
     if (!app_control_init(&g_app_services)) {
         traffic_all_red();
@@ -277,7 +372,8 @@ int main(void)
 
   /* Clear update flag generated by UG during TIM2 init so tick #1 occurs at exact 10 ms */
   __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
-  if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK) {
+  if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK)
+  {
 #if PLATFORM_FULL_INTEGRATION
     traffic_all_red();
 #endif
@@ -335,20 +431,64 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief I2C1 Initialization Function
+  * @brief GPIO Initialization Function
   * @param None
   * @retval None
   */
+static void MX_GPIO_Init(void)
+{
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+  /* GPIO Ports Clock Enable */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
+  __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, TL1_A_Pin | TL1_B_Pin | TL2_A_Pin | TL2_B_Pin,
+                    GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : B1_Pin */
+  GPIO_InitStruct.Pin = B1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LD2_Pin */
+  GPIO_InitStruct.Pin = LD2_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : LD3_Pin */
+  GPIO_InitStruct.Pin = LD3_Pin;
+  HAL_GPIO_Init(LD3_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : TL1_A_Pin TL1_B_Pin TL2_A_Pin TL2_B_Pin */
+  GPIO_InitStruct.Pin = TL1_A_Pin | TL1_B_Pin | TL2_A_Pin | TL2_B_Pin;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : BTN_1_Pin BTN_2_Pin BTN_3_Pin BTN_4_Pin */
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Pin = BTN_1_Pin | BTN_2_Pin;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  GPIO_InitStruct.Pin = BTN_3_Pin;
+  HAL_GPIO_Init(BTN_3_GPIO_Port, &GPIO_InitStruct);
+  GPIO_InitStruct.Pin = BTN_4_Pin;
+  HAL_GPIO_Init(BTN_4_GPIO_Port, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 2, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+
 static void MX_I2C1_Init(void)
 {
-
-  /* USER CODE BEGIN I2C1_Init 0 */
-
-  /* USER CODE END I2C1_Init 0 */
-
-  /* USER CODE BEGIN I2C1_Init 1 */
-
-  /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
   hi2c1.Init.ClockSpeed = 100000;
   hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
@@ -362,60 +502,33 @@ static void MX_I2C1_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN I2C1_Init 2 */
-
-  /* USER CODE END I2C1_Init 2 */
-
 }
 
-/**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_TIM2_Init(void)
 {
+  TIM_ClockConfigTypeDef clock = {0};
+  TIM_MasterConfigTypeDef master = {0};
 
-  /* USER CODE BEGIN TIM2_Init 0 */
-  /*
-   * Clock calculation for 10 ms periodic interrupt:
-   * - SYSCLK = 64 MHz, APB1 = HCLK / 2 = 32 MHz -> f_TIM2 = 2 * APB1 = 64 MHz
-   * - Prescaler = 63  -> Counter clock = 64 MHz / (63 + 1) = 1 MHz (1 us / count)
-   * - Period    = 9999 -> T = (9999 + 1) * 1 us = 10,000 us = 10.000 ms (0.010 s)
-   */
-  /* USER CODE END TIM2_Init 0 */
-
-  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 63;
+  /* APB1 timer clock is 64 MHz. (6399 + 1) * (99 + 1) / 64 MHz = 10 ms. */
+  htim2.Init.Prescaler = 6399;
+  htim2.Init.Period = 99;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 9999;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
   {
     Error_Handler();
   }
-  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
-  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+
+  clock.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  master.MasterOutputTrigger = TIM_TRGO_RESET;
+  master.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIM_ConfigClockSource(&htim2, &clock) != HAL_OK ||
+      HAL_TIMEx_MasterConfigSynchronization(&htim2, &master) != HAL_OK)
   {
     Error_Handler();
   }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
-
 }
 
 /**
@@ -451,77 +564,6 @@ static void MX_USART2_UART_Init(void)
 
 }
 
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, TL2_B_Pin|TL1_A_Pin|TL2_A_Pin|TL1_B_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : B1_Pin */
-  GPIO_InitStruct.Pin = B1_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : LD2_Pin */
-  GPIO_InitStruct.Pin = LD2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : TL2_B_Pin TL1_A_Pin TL2_A_Pin TL1_B_Pin */
-  GPIO_InitStruct.Pin = TL2_B_Pin|TL1_A_Pin|TL2_A_Pin|TL1_B_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : BTN_3_Pin */
-  GPIO_InitStruct.Pin = BTN_3_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(BTN_3_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : LD3_Pin */
-  GPIO_InitStruct.Pin = LD3_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(LD3_GPIO_Port, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : BTN_1_Pin BTN_2_Pin */
-  GPIO_InitStruct.Pin = BTN_1_Pin|BTN_2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : BTN_4_Pin */
-  GPIO_InitStruct.Pin = BTN_4_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(BTN_4_GPIO_Port, &GPIO_InitStruct);
-
-}
-
 /* USER CODE BEGIN 4 */
 /**
   * @brief  TIM period elapsed callback in non-blocking mode.
@@ -534,12 +576,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM2)
   {
     uint32_t c0 = DWT->CYCCNT;
-    uint16_t t0 = (uint16_t)__HAL_TIM_GET_COUNTER(htim);
 
     SCH_Update();
 
     uint32_t cycles = DWT->CYCCNT - c0;
-    uint16_t elapsed_us = (uint16_t)((uint16_t)__HAL_TIM_GET_COUNTER(htim) - t0);
+    /* SYSCLK = 64 MHz -> 64 cycles = 1 us */
+    uint16_t elapsed_us = (uint16_t)((cycles + 32U) / 64U);
     g_last_isr_cycles = cycles;
     if (cycles > g_max_isr_cycles)
     {
