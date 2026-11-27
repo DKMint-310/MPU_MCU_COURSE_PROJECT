@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body (Platform, TIM2 10 ms ISR & Scheduler)
+  * @brief          : Main program body
   ******************************************************************************
   * @attention
   *
@@ -25,34 +25,14 @@
 #include <stdbool.h>
 #include "scheduler.h"
 #include "software_timer.h"
-#include "global.h"
-#include "app_control.h"
-
-#if !defined(PLATFORM_FULL_INTEGRATION)
-#  if defined(__has_include)
-#    if __has_include("peripheral_stm32.h") && __has_include("button.h") \
-        && __has_include("traffic_light.h") && __has_include("dht20.h") \
-        && __has_include("lcd.h") && __has_include("display.h") \
-        && __has_include("fsm_tuning.h")
-#      define PLATFORM_FULL_INTEGRATION 1
-#    else
-#      define PLATFORM_FULL_INTEGRATION 0
-#    endif
-#  else
-#    define PLATFORM_FULL_INTEGRATION 0
-#  endif
-#endif
-
-#if PLATFORM_FULL_INTEGRATION
 #include "peripheral_stm32.h"
 #include "button.h"
 #include "traffic_light.h"
 #include "dht20.h"
 #include "lcd.h"
 #include "display.h"
-#include "fsm_tuning.h"
-void app_control_run(void);
-#endif
+#include "global.h"
+#include "app_control.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -63,10 +43,16 @@ void app_control_run(void);
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 /*
- * Define BOARD_DIAG_STEP3 (e.g. via compiler -DBOARD_DIAG_STEP3) ONLY during
- * isolated Step 3 hardware bring-up (H01-H04). Disabled in normal builds so
- * no HAL_Delay exists in the scheduled firmware.
+ * Quick hardware mapping constants (adjust after Step 3 kit check if needed):
+ * - BUTTON_ACTIVE_HIGH: false = active-LOW buttons with internal GPIO_PULLUP
+ * - LIGHT_CODE_*: 2-bit truth table ((Signal_A << 1) | Signal_B) for each color
+ * - LCD_FALLBACK_ADDR: used if auto-scan does not detect an LCD at startup
  */
+#define BUTTON_ACTIVE_HIGH  false
+#define LIGHT_CODE_RED      3U
+#define LIGHT_CODE_GREEN    2U
+#define LIGHT_CODE_AMBER    1U
+#define LCD_FALLBACK_ADDR   LCD_OHSTEM_ADDRESS
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -80,14 +66,7 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-/* Live-Expression measurement variables for acceptance tests H04, S01, S02, S05 */
-volatile uint32_t g_last_isr_cycles = 0U;
-volatile uint32_t g_max_isr_cycles = 0U;
-volatile uint16_t g_last_isr_us = 0U;
-volatile uint16_t g_max_isr_us = 0U;
-volatile uint32_t g_oneshot_fired_count = 0U;
-volatile uint8_t g_i2c_found_addrs[8] = {0};
-volatile uint8_t g_i2c_found_count = 0U;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -97,33 +76,12 @@ static void MX_USART2_UART_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
-static void platform_enable_cycle_counter(void);
-static bool platform_register_tasks(void);
-#if !PLATFORM_FULL_INTEGRATION
-static void toggle_PA5(void);
-static void toggle_PC9(void);
-static void one_shot_test(void);
-#endif
-#if defined(BOARD_DIAG_STEP3)
-static void platform_run_step3_hardware_diag(void);
-#endif
+
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static void platform_enable_cycle_counter(void)
-{
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CYCCNT = 0U;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-}
-
-#if PLATFORM_FULL_INTEGRATION
-/*
- * Explicit enum translation between Member 3 (global.h) and Member 2 (button.h,
- * traffic_light.h, display.h) so differing enumerator orders cannot mismatch.
- */
-static app_event_t platform_button_take_event(uint8_t id)
+static app_event_t app_read_button_event(uint8_t id)
 {
     switch (button_take_event(id)) {
     case BUTTON_PRESS: return APP_EVENT_PRESS;
@@ -133,7 +91,7 @@ static app_event_t platform_button_take_event(uint8_t id)
     }
 }
 
-static light_t platform_map_light(app_light_t light)
+static light_t app_to_driver_light(app_light_t light)
 {
     switch (light) {
     case APP_GREEN: return LIGHT_GREEN;
@@ -143,12 +101,12 @@ static light_t platform_map_light(app_light_t light)
     }
 }
 
-static bool platform_traffic_apply_pair(app_light_t road1, app_light_t road2)
+static bool app_apply_lights(app_light_t road1, app_light_t road2)
 {
-    return traffic_apply_pair(platform_map_light(road1), platform_map_light(road2));
+    return traffic_apply_pair(app_to_driver_light(road1), app_to_driver_light(road2));
 }
 
-static display_view_t platform_read_display_view(void)
+static display_view_t app_read_display_view(void)
 {
     app_snapshot_t snap = app_get_snapshot();
     display_view_t view = {0};
@@ -197,17 +155,12 @@ static display_view_t platform_read_display_view(void)
     return view;
 }
 
-static const app_services_t g_app_services = {
-    .button_take_event = platform_button_take_event,
-    .timer_start = timer_start,
-    .timer_cancel = timer_cancel,
-    .timer_take_expired = timer_take_expired,
-    .traffic_apply_pair = platform_traffic_apply_pair,
-    .traffic_all_red = traffic_all_red,
-    .timer_remaining_ms = timer_remaining_ms
-};
+static void heartbeat_task(void)
+{
+    HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
+}
 
-static bool platform_register_tasks(void)
+static void system_setup_and_schedule(void)
 {
     static const peripheral_pin_t button_pins[BUTTON_COUNT] = {
         {BTN_1_GPIO_Port, BTN_1_Pin},
@@ -215,112 +168,52 @@ static bool platform_register_tasks(void)
         {BTN_3_GPIO_Port, BTN_3_Pin},
         {BTN_4_GPIO_Port, BTN_4_Pin}
     };
-    /* Active-LOW buttons with internal GPIO_PULLUP (confirm in H03) */
-    static const bool button_active_high[BUTTON_COUNT] = {false, false, false, false};
+    static const bool button_polarity[BUTTON_COUNT] = {
+        BUTTON_ACTIVE_HIGH, BUTTON_ACTIVE_HIGH, BUTTON_ACTIVE_HIGH, BUTTON_ACTIVE_HIGH
+    };
     static const peripheral_pin_t light_pins[4] = {
         {TL1_A_GPIO_Port, TL1_A_Pin},
         {TL1_B_GPIO_Port, TL1_B_Pin},
         {TL2_A_GPIO_Port, TL2_A_Pin},
         {TL2_B_GPIO_Port, TL2_B_Pin}
     };
-    /* Default 2-bit light encoding table pending physical H02 measurement */
     static const traffic_codes_t light_codes[2] = {
-        {.red = 3U, .amber = 1U, .green = 2U},
-        {.red = 3U, .amber = 1U, .green = 2U}
+        {.red = LIGHT_CODE_RED, .amber = LIGHT_CODE_AMBER, .green = LIGHT_CODE_GREEN},
+        {.red = LIGHT_CODE_RED, .amber = LIGHT_CODE_AMBER, .green = LIGHT_CODE_GREEN}
     };
-    peripheral_i2c_t i2c_bus = peripheral_stm32_i2c(&hi2c1);
+    static const app_services_t services = {
+        .button_take_event = app_read_button_event,
+        .timer_start = timer_start,
+        .timer_cancel = timer_cancel,
+        .timer_take_expired = timer_take_expired,
+        .traffic_apply_pair = app_apply_lights,
+        .traffic_all_red = traffic_all_red,
+        .timer_remaining_ms = timer_remaining_ms
+    };
 
-    if (!peripheral_stm32_bind_buttons(button_pins, button_active_high)) return false;
-    if (!peripheral_stm32_bind_lights(light_pins, light_codes)) return false;
+    peripheral_i2c_t i2c_bus = peripheral_stm32_i2c(&hi2c1);
+    uint8_t lcd_addr = peripheral_stm32_scan_lcd(&hi2c1, LCD_FALLBACK_ADDR);
+
+    SCH_Init();
+    timer_init();
+
+    (void)peripheral_stm32_bind_buttons(button_pins, button_polarity);
+    (void)peripheral_stm32_bind_lights(light_pins, light_codes);
     traffic_all_red();
 
     (void)dht20_init(&i2c_bus);
-    (void)lcd_configure(&i2c_bus, LCD_GROVE_ADDRESS);
-    if (!display_init(platform_read_display_view)) return false;
+    (void)lcd_configure(&i2c_bus, lcd_addr);
+    (void)display_init(app_read_display_view);
+    (void)app_control_init(&services);
 
-    if (!app_control_init(&g_app_services)) {
-        traffic_all_red();
-        return false;
-    }
-
-    /*
-     * Mandatory registration order for simultaneous deadlines (Team Plan p. 5):
-     * 1. Software timer (10 ms) - first tick after 10 ms so 1000 ms = 100 real ticks
-     * 2. Button sampling (10 ms)
-     * 3. Control / active FSM (10 ms)
-     * 4. Sensor service (10 ms)
-     * 5. Display renderer (200 ms, initial render at boot delay = 0)
-     */
-    if (SCH_Add_Task(timer_tick, 1U, 1U) == SCH_NO_TASK_ID) return false;
-    if (SCH_Add_Task(button_sample, 1U, 1U) == SCH_NO_TASK_ID) return false;
-    if (SCH_Add_Task(app_control_run, 1U, 1U) == SCH_NO_TASK_ID) return false;
-    if (SCH_Add_Task(dht20_task, 1U, 1U) == SCH_NO_TASK_ID) return false;
-    if (SCH_Add_Task(display_task, 0U, 20U) == SCH_NO_TASK_ID) return false;
-
-    return true;
+    /* Register scheduled tasks in contract order (1 tick = 10 ms) */
+    (void)SCH_Add_Task(timer_tick, 1U, 1U);       /* 10 ms: software timers */
+    (void)SCH_Add_Task(button_sample, 1U, 1U);    /* 10 ms: button debounce */
+    (void)SCH_Add_Task(app_control_run, 1U, 1U);  /* 10 ms: active mode FSM */
+    (void)SCH_Add_Task(dht20_task, 1U, 1U);       /* 10 ms: non-blocking DHT20 */
+    (void)SCH_Add_Task(display_task, 1U, 20U);    /* 200 ms: LCD 16x2 update */
+    (void)SCH_Add_Task(heartbeat_task, 1U, 50U);  /* 500 ms: onboard LD2 blink */
 }
-#else
-static void toggle_PA5(void)
-{
-    HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-}
-
-static void toggle_PC9(void)
-{
-    HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
-}
-
-static void one_shot_test(void)
-{
-    ++g_oneshot_fired_count;
-}
-
-static bool platform_register_tasks(void)
-{
-    /*
-     * Standalone platform & scheduler verification profile (Step 4.2 / S01-S02):
-     * - Software timer service every 10 ms (1 tick)
-     * - LD2 (PA5) toggles every 500 ms (50 ticks)
-     * - LD3 (PC9) toggles every 1000 ms (100 ticks)
-     * - One-shot verification fires once after 3000 ms (300 ticks)
-     */
-    if (SCH_Add_Task(timer_tick, 1U, 1U) == SCH_NO_TASK_ID) return false;
-    if (SCH_Add_Task(toggle_PA5, 0U, 50U) == SCH_NO_TASK_ID) return false;
-    if (SCH_Add_Task(toggle_PC9, 0U, 100U) == SCH_NO_TASK_ID) return false;
-    if (SCH_Add_Task(one_shot_test, 300U, 0U) == SCH_NO_TASK_ID) return false;
-
-    return true;
-}
-#endif
-
-#if defined(BOARD_DIAG_STEP3)
-static void platform_run_step3_hardware_diag(void)
-{
-    uint8_t addr;
-    g_i2c_found_count = 0U;
-    for (addr = 1U; addr < 128U; ++addr) {
-        if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(addr << 1U), 1U, 10U) == HAL_OK) {
-            if (g_i2c_found_count < 8U) {
-                g_i2c_found_addrs[g_i2c_found_count++] = addr;
-            }
-        }
-    }
-
-    for (;;) {
-        uint8_t combo;
-        for (combo = 0U; combo < 4U; ++combo) {
-            GPIO_PinState a = ((combo >> 1U) & 1U) ? GPIO_PIN_SET : GPIO_PIN_RESET;
-            GPIO_PinState b = (combo & 1U) ? GPIO_PIN_SET : GPIO_PIN_RESET;
-            HAL_GPIO_WritePin(TL1_A_GPIO_Port, TL1_A_Pin, a);
-            HAL_GPIO_WritePin(TL1_B_GPIO_Port, TL1_B_Pin, b);
-            HAL_GPIO_WritePin(TL2_A_GPIO_Port, TL2_A_Pin, a);
-            HAL_GPIO_WritePin(TL2_B_GPIO_Port, TL2_B_Pin, b);
-            HAL_GPIO_TogglePin(LD2_GPIO_Port, LD2_Pin);
-            HAL_Delay(2000U);
-        }
-    }
-}
-#endif
 /* USER CODE END 0 */
 
 /**
@@ -346,7 +239,7 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-  platform_enable_cycle_counter();
+
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -355,30 +248,10 @@ int main(void)
   MX_I2C1_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-#if defined(BOARD_DIAG_STEP3)
-  platform_run_step3_hardware_diag();
-#endif
+  system_setup_and_schedule();
 
-  SCH_Init();
-  timer_init();
-
-  /* Check task registration errors before starting automatic control (Team Plan p. 4) */
-  if (!platform_register_tasks()) {
-#if PLATFORM_FULL_INTEGRATION
-    traffic_all_red();
-#endif
-    Error_Handler();
-  }
-
-  /* Clear update flag generated by UG during TIM2 init so tick #1 occurs at exact 10 ms */
   __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE);
-  if (HAL_TIM_Base_Start_IT(&htim2) != HAL_OK)
-  {
-#if PLATFORM_FULL_INTEGRATION
-    traffic_all_red();
-#endif
-    Error_Handler();
-  }
+  (void)HAL_TIM_Base_Start_IT(&htim2);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -457,18 +330,16 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : LD2_Pin */
+  /*Configure GPIO pins : LD2_Pin LD3_Pin TL1_A/B TL2_A/B */
   GPIO_InitStruct.Pin = LD2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : LD3_Pin */
   GPIO_InitStruct.Pin = LD3_Pin;
   HAL_GPIO_Init(LD3_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : TL1_A_Pin TL1_B_Pin TL2_A_Pin TL2_B_Pin */
   GPIO_InitStruct.Pin = TL1_A_Pin | TL1_B_Pin | TL2_A_Pin | TL2_B_Pin;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
@@ -565,33 +436,11 @@ static void MX_USART2_UART_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-/**
-  * @brief  TIM period elapsed callback in non-blocking mode.
-  *         TIM2 10 ms ISR strictly calls SCH_Update() in O(1) time.
-  * @param  htim: TIM handle
-  * @retval None
-  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   if (htim->Instance == TIM2)
   {
-    uint32_t c0 = DWT->CYCCNT;
-
     SCH_Update();
-
-    uint32_t cycles = DWT->CYCCNT - c0;
-    /* SYSCLK = 64 MHz -> 64 cycles = 1 us */
-    uint16_t elapsed_us = (uint16_t)((cycles + 32U) / 64U);
-    g_last_isr_cycles = cycles;
-    if (cycles > g_max_isr_cycles)
-    {
-      g_max_isr_cycles = cycles;
-    }
-    g_last_isr_us = elapsed_us;
-    if (elapsed_us > g_max_isr_us)
-    {
-      g_max_isr_us = elapsed_us;
-    }
   }
 }
 /* USER CODE END 4 */

@@ -60,11 +60,11 @@ bool peripheral_stm32_bind_lights(const peripheral_pin_t pins[4],
 }
 
 #ifdef HAL_I2C_MODULE_ENABLED
-enum { I2C_TRANSFER_TIMEOUT_MS = 3 };
+/* 20 ms comfortably covers a full 16-char LCD line over 100 kHz I2C */
+enum { I2C_TRANSFER_TIMEOUT_MS = 20 };
 
 static bool i2c_available(I2C_HandleTypeDef *handle)
 {
-    /* Skip HAL's fixed BUSY wait when the bus is already stuck. */
     return handle != NULL && HAL_I2C_GetState(handle) == HAL_I2C_STATE_READY &&
            !__HAL_I2C_GET_FLAG(handle, I2C_FLAG_BUSY);
 }
@@ -93,5 +93,35 @@ peripheral_i2c_t peripheral_stm32_i2c(I2C_HandleTypeDef *handle)
         .read = i2c_read,
         .now_ms = HAL_GetTick
     };
+}
+
+uint8_t peripheral_stm32_scan_lcd(I2C_HandleTypeDef *handle, uint8_t fallback_addr)
+{
+    /* Common HCMUT kit LCD addresses: OhStem 0x21, PCF8574 0x27, PCF8574A 0x3F, Grove 0x3E */
+    static const uint8_t preferred[] = {0x21U, 0x27U, 0x3FU, 0x3EU};
+    uint8_t i, addr;
+
+    if (handle == NULL) {
+        return fallback_addr;
+    }
+
+    for (i = 0U; i < sizeof(preferred); ++i) {
+        if (HAL_I2C_IsDeviceReady(handle, (uint16_t)(preferred[i] << 1U), 1U, 5U) == HAL_OK) {
+            return preferred[i];
+        }
+    }
+
+    for (addr = 0x20U; addr <= 0x27U; ++addr) {
+        if (HAL_I2C_IsDeviceReady(handle, (uint16_t)(addr << 1U), 1U, 5U) == HAL_OK) {
+            return addr;
+        }
+    }
+    for (addr = 0x39U; addr <= 0x3FU; ++addr) {
+        if (HAL_I2C_IsDeviceReady(handle, (uint16_t)(addr << 1U), 1U, 5U) == HAL_OK) {
+            return addr;
+        }
+    }
+
+    return fallback_addr;
 }
 #endif

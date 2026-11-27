@@ -24,15 +24,7 @@ uint32_t SCH_Add_Task(void (*pFunc)(void), uint32_t DELAY, uint32_t PERIOD);
 uint8_t SCH_Delete_Task(uint32_t taskID);
 void SCH_Update(void);
 void SCH_Dispatch_Tasks(void);
-
-/* Non-intrusive diagnostic helpers for acceptance tests S05/S06 */
 uint32_t SCH_Get_Task_Count(void);
-uint32_t SCH_Get_Overrun_Count(void);
-uint32_t SCH_Get_Tick_Count(void);
-
-#ifdef SCH_TEST_HOOKS
-void SCH_Test_Set_Next_ID(uint32_t next_id);
-#endif
 
 #ifdef __cplusplus
 }

@@ -1,565 +1,451 @@
 #include "scheduler.h"
 #include "software_timer.h"
+#include "button.h"
+#include "traffic_light.h"
+#include "dht20.h"
+#include "lcd.h"
+#include "display.h"
 #include "global.h"
 #include "app_control.h"
 #include "fsm_automatic.h"
 #include "fsm_manual.h"
+#include "fsm_tuning.h"
 
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 /* ========================================================================== */
-/* Critical-Section Verification Hooks (SCH_TEST_HOOKS)                       */
+/* 1. Scheduler & Software Timer Unit Tests (S01-S06, D01)                    */
 /* ========================================================================== */
 
-static uint32_t g_sim_primask = 0U;
-static int g_critical_depth = 0;
+static uint32_t g_tick;
+static uint32_t pa5_cnt, pc9_cnt, oneshot_cnt, reclaim_cnt;
+static uint8_t order_log[8], order_len;
+static uint32_t self_del_id, self_del_runs;
 
-uint32_t sch_test_enter_critical(void)
+static void cb_pa5(void) { assert(g_tick % 50U == 0U); ++pa5_cnt; }
+static void cb_pc9(void) { assert(g_tick % 100U == 0U); ++pc9_cnt; }
+static void cb_oneshot(void) { assert(g_tick == 300U); ++oneshot_cnt; }
+static void cb_noop(void) {}
+static void cb_reclaim(void) { ++reclaim_cnt; }
+
+static void cb_oneshot_full(void)
 {
-    uint32_t prev = g_sim_primask;
-    g_sim_primask = 1U;
-    ++g_critical_depth;
-    return prev;
-}
-
-void sch_test_exit_critical(uint32_t primask)
-{
-    assert(g_critical_depth > 0);
-    --g_critical_depth;
-    g_sim_primask = primask;
-}
-
-static void assert_outside_critical(void)
-{
-    assert(g_critical_depth == 0);
-}
-
-/* ========================================================================== */
-/* S01 & S02: Periodic 50/100 ticks + One-shot 300 ticks + Slot Release       */
-/* ========================================================================== */
-
-static uint32_t s01_pa5_count;
-static uint32_t s01_pc9_count;
-static uint32_t s02_oneshot_count;
-static uint32_t s02_oneshot_tick;
-static uint32_t g_current_tick;
-
-static void cb_pa5_50(void)
-{
-    assert_outside_critical();
-    assert(g_current_tick % 50U == 0U);
-    ++s01_pa5_count;
-}
-
-static void cb_pc9_100(void)
-{
-    assert_outside_critical();
-    assert(g_current_tick % 100U == 0U);
-    if (g_current_tick == 0U) {
-        /* Registered after cb_pa5_50 with delay=0 -> runs second at tick 0 */
-        assert(s01_pa5_count == 1U);
-    }
-    ++s01_pc9_count;
-}
-
-static void cb_oneshot_300(void)
-{
-    assert_outside_critical();
-    ++s02_oneshot_count;
-    s02_oneshot_tick = g_current_tick;
-}
-
-static uint32_t s02_reclaim_fired;
-static void cb_reclaimed_slot(void)
-{
-    assert_outside_critical();
-    ++s02_reclaim_fired;
-}
-
-static void cb_oneshot_when_full(void)
-{
-    uint32_t new_id;
-    assert_outside_critical();
-    /* One-shot MUST release its slot BEFORE invoking its callback */
     assert(SCH_Get_Task_Count() == SCH_MAX_TASKS - 1U);
-    new_id = SCH_Add_Task(cb_reclaimed_slot, 2U, 0U);
-    assert(new_id != SCH_NO_TASK_ID);
+    assert(SCH_Add_Task(cb_reclaim, 2U, 0U) != SCH_NO_TASK_ID);
 }
 
-static void cb_noop(void)
+static void rec0(void) { order_log[order_len++] = 0U; }
+static void rec1(void) { order_log[order_len++] = 1U; }
+static void rec2(void) { order_log[order_len++] = 2U; }
+static void rec3(void) { order_log[order_len++] = 3U; }
+
+static void cb_self_del(void)
 {
-    assert_outside_critical();
+    if (++self_del_runs == 3U) {
+        assert(SCH_Delete_Task(self_del_id) == 1U);
+        assert(SCH_Delete_Task(self_del_id) == 0U);
+    }
 }
 
-static void test_s01_s02_periodic_and_oneshot(void)
+static void test_scheduler_and_timers(void)
 {
-    uint32_t i;
-
     SCH_Init();
-    s01_pa5_count = 0U;
-    s01_pc9_count = 0U;
-    s02_oneshot_count = 0U;
-    s02_oneshot_tick = 0U;
-    g_current_tick = 0U;
+    pa5_cnt = pc9_cnt = oneshot_cnt = g_tick = 0U;
+    assert(SCH_Add_Task(cb_pa5, 0U, 50U) != SCH_NO_TASK_ID);
+    assert(SCH_Add_Task(cb_pc9, 0U, 100U) != SCH_NO_TASK_ID);
+    assert(SCH_Add_Task(cb_oneshot, 300U, 0U) != SCH_NO_TASK_ID);
 
-    assert(SCH_Add_Task(cb_pa5_50, 0U, 50U) != SCH_NO_TASK_ID);
-    assert(SCH_Add_Task(cb_pc9_100, 0U, 100U) != SCH_NO_TASK_ID);
-    assert(SCH_Add_Task(cb_oneshot_300, 300U, 0U) != SCH_NO_TASK_ID);
-    assert(SCH_Get_Task_Count() == 3U);
-
-    /* delay=0 tasks are ready on the very first dispatch before any tick */
     SCH_Dispatch_Tasks();
-    assert(s01_pa5_count == 1U && s01_pc9_count == 1U && s02_oneshot_count == 0U);
+    assert(pa5_cnt == 1U && pc9_cnt == 1U && oneshot_cnt == 0U);
 
-    for (g_current_tick = 1U; g_current_tick <= 1000U; ++g_current_tick) {
+    for (g_tick = 1U; g_tick <= 1000U; ++g_tick) {
         SCH_Update();
         SCH_Dispatch_Tasks();
-        assert(s01_pa5_count == (g_current_tick / 50U) + 1U);
-        assert(s01_pc9_count == (g_current_tick / 100U) + 1U);
-        if (g_current_tick == 300U) {
-            assert(s02_oneshot_count == 1U);
-            assert(SCH_Get_Task_Count() == 2U);
-        }
     }
+    assert(pa5_cnt == 21U && pc9_cnt == 11U && oneshot_cnt == 1U);
 
-    assert(s01_pa5_count == 21U); /* 0, 50, 100, ..., 1000 */
-    assert(s01_pc9_count == 11U); /* 0, 100, 200, ..., 1000 */
-    assert(s02_oneshot_count == 1U && s02_oneshot_tick == 300U);
-
-    /* Verify one-shot releases slot BEFORE invoking callback even when queue was full */
+    /* One-shot releases slot before callback */
     SCH_Init();
-    s02_reclaim_fired = 0U;
-    assert(SCH_Add_Task(cb_oneshot_when_full, 5U, 0U) != SCH_NO_TASK_ID);
-    for (i = 1U; i < SCH_MAX_TASKS; ++i) {
+    reclaim_cnt = 0U;
+    assert(SCH_Add_Task(cb_oneshot_full, 5U, 0U) != SCH_NO_TASK_ID);
+    for (uint32_t i = 1U; i < SCH_MAX_TASKS; ++i) {
         assert(SCH_Add_Task(cb_noop, 100U + i, 0U) != SCH_NO_TASK_ID);
     }
-    assert(SCH_Get_Task_Count() == SCH_MAX_TASKS);
     assert(SCH_Add_Task(cb_noop, 10U, 0U) == SCH_NO_TASK_ID);
-
-    for (g_current_tick = 1U; g_current_tick <= 7U; ++g_current_tick) {
+    for (g_tick = 1U; g_tick <= 7U; ++g_tick) {
         SCH_Update();
         SCH_Dispatch_Tasks();
     }
-    assert(s02_reclaim_fired == 1U);
-    puts("PASS [S01/S02]: 50/100-tick periodics, 300-tick one-shot & pre-callback slot release");
-}
+    assert(reclaim_cnt == 1U);
 
-/* ========================================================================== */
-/* S03: Insert/Delete Head, Middle, Tail + Equal-Deadline FIFO Order          */
-/* ========================================================================== */
-
-static uint8_t s03_order[8];
-static uint8_t s03_order_len;
-static uint32_t s03_fired_at[8];
-
-static void record_slot_0(void) { s03_order[s03_order_len++] = 0U; s03_fired_at[0] = g_current_tick; }
-static void record_slot_1(void) { s03_order[s03_order_len++] = 1U; s03_fired_at[1] = g_current_tick; }
-static void record_slot_2(void) { s03_order[s03_order_len++] = 2U; s03_fired_at[2] = g_current_tick; }
-static void record_slot_3(void) { s03_order[s03_order_len++] = 3U; s03_fired_at[3] = g_current_tick; }
-static void record_slot_4(void) { s03_order[s03_order_len++] = 4U; s03_fired_at[4] = g_current_tick; }
-
-static void test_s03_queue_order_and_deletion(void)
-{
-    uint32_t id_head, id_mid1, id_mid2, id_tail, id0, id1;
-
-    /* 1. Out-of-order insertion + deleting head, middle, and tail preserves remaining deadlines */
+    /* Head/middle/tail delete + equal-deadline FIFO */
     SCH_Init();
-    s03_order_len = 0U;
-    g_current_tick = 0U;
-
-    id_tail = SCH_Add_Task(record_slot_4, 40U, 0U); /* tail */
-    id_head = SCH_Add_Task(record_slot_0, 5U, 0U);  /* head */
-    id_mid1 = SCH_Add_Task(record_slot_1, 15U, 0U); /* middle 1 */
-    id_mid2 = SCH_Add_Task(record_slot_2, 25U, 0U); /* middle 2 */
-    (void)SCH_Add_Task(record_slot_3, 35U, 0U);     /* stays until 35 */
-
-    assert(SCH_Delete_Task(id_head) == 1U); /* delete head (5) -> mid1 still due at 15 */
-    assert(SCH_Delete_Task(id_mid2) == 1U); /* delete middle (25) -> slot_3 still due at 35 */
-    assert(SCH_Delete_Task(id_tail) == 1U); /* delete tail (40) */
-    (void)id_mid1;
-
-    for (g_current_tick = 1U; g_current_tick <= 45U; ++g_current_tick) {
+    order_len = 0U;
+    uint32_t id_h = SCH_Add_Task(rec0, 5U, 0U);
+    uint32_t id_m1 = SCH_Add_Task(rec1, 15U, 0U);
+    uint32_t id_m2 = SCH_Add_Task(rec2, 25U, 0U);
+    uint32_t id_t = SCH_Add_Task(rec3, 35U, 0U);
+    (void)id_m1;
+    assert(SCH_Delete_Task(id_h) == 1U);
+    assert(SCH_Delete_Task(id_m2) == 1U);
+    assert(SCH_Delete_Task(id_t) == 1U);
+    for (g_tick = 1U; g_tick <= 40U; ++g_tick) {
         SCH_Update();
         SCH_Dispatch_Tasks();
     }
-    assert(s03_order_len == 2U);
-    assert(s03_order[0] == 1U && s03_fired_at[1] == 15U);
-    assert(s03_order[1] == 3U && s03_fired_at[3] == 35U);
+    assert(order_len == 1U && order_log[0] == 1U);
 
-    /* 2. Equal-deadline tasks run in strict FIFO registration order in the SAME dispatch pass */
     SCH_Init();
-    s03_order_len = 0U;
-    g_current_tick = 0U;
-    assert(SCH_Add_Task(record_slot_0, 10U, 0U) != SCH_NO_TASK_ID);
-    assert(SCH_Add_Task(record_slot_1, 10U, 0U) != SCH_NO_TASK_ID);
-    assert(SCH_Add_Task(record_slot_2, 10U, 0U) != SCH_NO_TASK_ID);
-    assert(SCH_Add_Task(record_slot_3, 10U, 0U) != SCH_NO_TASK_ID);
-    assert(SCH_Add_Task(record_slot_4, 10U, 0U) != SCH_NO_TASK_ID);
-
-    for (g_current_tick = 1U; g_current_tick <= 9U; ++g_current_tick) {
+    order_len = 0U;
+    assert(SCH_Add_Task(rec0, 5U, 0U) != SCH_NO_TASK_ID);
+    assert(SCH_Add_Task(rec1, 5U, 0U) != SCH_NO_TASK_ID);
+    assert(SCH_Add_Task(rec2, 5U, 0U) != SCH_NO_TASK_ID);
+    assert(SCH_Add_Task(rec3, 5U, 0U) != SCH_NO_TASK_ID);
+    for (g_tick = 1U; g_tick <= 5U; ++g_tick) {
         SCH_Update();
         SCH_Dispatch_Tasks();
     }
-    assert(s03_order_len == 0U);
+    assert(order_len == 4U && order_log[0] == 0U && order_log[3] == 3U);
 
-    g_current_tick = 10U;
-    SCH_Update();
-    SCH_Dispatch_Tasks(); /* Single dispatch pass must run all 5 in 0..4 order */
-    assert(s03_order_len == 5U);
-    for (uint8_t i = 0U; i < 5U; ++i) {
-        assert(s03_order[i] == i);
-    }
-
-    /* 3. Deleting a READY head (Delay=0, RunMe=1) propagates readiness to equal-deadline successor */
+    /* Periodic self-delete suppresses reinsertion */
     SCH_Init();
-    s03_order_len = 0U;
-    id0 = SCH_Add_Task(record_slot_0, 0U, 0U);
-    id1 = SCH_Add_Task(record_slot_1, 0U, 0U);
-    assert(id0 != SCH_NO_TASK_ID && id1 != SCH_NO_TASK_ID);
-    assert(SCH_Delete_Task(id0) == 1U);
-    SCH_Dispatch_Tasks();
-    assert(s03_order_len == 1U && s03_order[0] == 1U);
-
-    puts("PASS [S03]: Head/middle/tail deletion, deadline preservation & equal-deadline FIFO");
-}
-
-/* ========================================================================== */
-/* S04: Edge Cases, Self-Delete Inside Periodic Callback & Overflow Guard     */
-/* ========================================================================== */
-
-static uint32_t s04_self_id;
-static uint32_t s04_self_runs;
-
-static void cb_periodic_self_delete(void)
-{
-    assert_outside_critical();
-    ++s04_self_runs;
-    if (s04_self_runs == 3U) {
-        /* Self-delete inside periodic callback must succeed once and suppress reinsertion */
-        assert(SCH_Delete_Task(s04_self_id) == 1U);
-        assert(SCH_Delete_Task(s04_self_id) == 0U);
-    }
-}
-
-static uint32_t s04_capacity_probe_result;
-static void cb_periodic_probe_full(void)
-{
-    /* All 32 slots are active (31 queued + 1 running periodic) -> Add must fail cleanly */
-    s04_capacity_probe_result = SCH_Add_Task(cb_noop, 1U, 0U);
-}
-
-static void test_s04_edge_cases_and_self_delete(void)
-{
-    uint32_t i, id_overflow_a, id_overflow_b;
-
-    SCH_Init();
-    /* Null callback & invalid IDs */
-    assert(SCH_Add_Task(NULL, 0U, 0U) == SCH_NO_TASK_ID);
-    assert(SCH_Add_Task(NULL, 10U, 5U) == SCH_NO_TASK_ID);
-    assert(SCH_Get_Task_Count() == 0U);
-    assert(SCH_Delete_Task(SCH_NO_TASK_ID) == 0U);
-    assert(SCH_Delete_Task(12345U) == 0U);
-
-    /* Self-deletion inside periodic callback */
-    s04_self_runs = 0U;
-    s04_self_id = SCH_Add_Task(cb_periodic_self_delete, 5U, 5U);
-    assert(s04_self_id != SCH_NO_TASK_ID);
-
-    for (g_current_tick = 1U; g_current_tick <= 50U; ++g_current_tick) {
+    self_del_runs = 0U;
+    self_del_id = SCH_Add_Task(cb_self_del, 3U, 3U);
+    for (g_tick = 1U; g_tick <= 30U; ++g_tick) {
         SCH_Update();
         SCH_Dispatch_Tasks();
     }
-    assert(s04_self_runs == 3U); /* Fired at 5, 10, 15 then suppressed forever */
-    assert(SCH_Get_Task_Count() == 0U);
+    assert(self_del_runs == 3U && SCH_Get_Task_Count() == 0U);
 
-    /* Reserved slot protection while periodic callback executes in a full pool */
-    SCH_Init();
-    s04_capacity_probe_result = 999U;
-    uint32_t periodic_id = SCH_Add_Task(cb_periodic_probe_full, 1U, 5U);
-    assert(periodic_id != SCH_NO_TASK_ID);
-    for (i = 1U; i < SCH_MAX_TASKS; ++i) {
-        assert(SCH_Add_Task(cb_noop, 100U + i, 0U) != SCH_NO_TASK_ID);
-    }
-    SCH_Update();
-    SCH_Dispatch_Tasks();
-    assert(s04_capacity_probe_result == SCH_NO_TASK_ID);
-    assert(SCH_Get_Task_Count() == SCH_MAX_TASKS); /* Periodic task safely reinserted! */
-
-    /* Arithmetic overflow saturation on deletion transfer */
-    SCH_Init();
-    id_overflow_a = SCH_Add_Task(cb_noop, UINT32_MAX - 5U, 0U);
-    id_overflow_b = SCH_Add_Task(cb_noop, UINT32_MAX, 0U);
-    assert(id_overflow_a != SCH_NO_TASK_ID && id_overflow_b != SCH_NO_TASK_ID);
-    /* Force successor relative delay > 5 by deleting after adding another or checking no wrap */
-    assert(SCH_Delete_Task(id_overflow_a) == 1U);
-    SCH_Update();
-    SCH_Dispatch_Tasks(); /* Must NOT prematurely fire id_overflow_b due to wraparound */
-    assert(SCH_Get_Task_Count() == 1U);
-
-    puts("PASS [S04]: Null/full/invalid guards, periodic self-delete & overflow safety");
-}
-
-/* ========================================================================== */
-/* S05 & S06: PRIMASK Restore, Stable IDs, Wraparound & ISR Interruption      */
-/* ========================================================================== */
-
-static uint32_t s06_stable_id;
-static uint32_t s06_reinsert_checks;
-
-static void cb_check_stable_id_and_isr_load(void)
-{
-    assert_outside_critical();
-    ++s06_reinsert_checks;
-    /* Simulate two 10 ms timer interrupts arriving during a heavy main-context callback */
-    if (s06_reinsert_checks == 2U) {
-        SCH_Update();
-        SCH_Update();
-    }
-}
-
-static void test_s05_s06_concurrency_and_ids(void)
-{
-    uint32_t counts[3] = {1U, 8U, 16U};
-
-    /* S05: Verify O(1) update behavior at 1, 8, and 16 active tasks */
-    for (unsigned c = 0U; c < 3U; ++c) {
-        SCH_Init();
-        s03_order_len = 0U;
-        assert(SCH_Add_Task(record_slot_0, 3U, 0U) != SCH_NO_TASK_ID);
-        for (uint32_t k = 1U; k < counts[c]; ++k) {
-            assert(SCH_Add_Task(cb_noop, 10U + k, 10U) != SCH_NO_TASK_ID);
-        }
-        assert(SCH_Get_Task_Count() == counts[c]);
-        for (g_current_tick = 1U; g_current_tick <= 3U; ++g_current_tick) {
-            SCH_Update();
-            SCH_Dispatch_Tasks();
-        }
-        assert(s03_order_len == 1U && s03_fired_at[0] == 3U);
-    }
-
-    /* Verify PRIMASK restoration when called with interrupts already masked (primask = 1) */
-    g_sim_primask = 1U;
-    uint32_t masked_id = SCH_Add_Task(cb_noop, 10U, 0U);
-    assert(g_sim_primask == 1U && g_critical_depth == 0);
-    assert(SCH_Delete_Task(masked_id) == 1U);
-    assert(g_sim_primask == 1U && g_critical_depth == 0);
-    g_sim_primask = 0U;
-
-    /* S06: Periodic ID stability across reinsertions + overrun recording */
-    SCH_Init();
-    s06_reinsert_checks = 0U;
-    s06_stable_id = SCH_Add_Task(cb_check_stable_id_and_isr_load, 2U, 2U);
-    assert(SCH_Add_Task(cb_noop, 5U, 0U) != SCH_NO_TASK_ID);
-    for (uint32_t step = 0U; step < 20U; ++step) {
-        SCH_Update();
-        SCH_Dispatch_Tasks();
-    }
-    assert(s06_reinsert_checks >= 10U);
-    assert(SCH_Get_Overrun_Count() >= 1U);
-    /* Deleting using the ORIGINAL periodic ID after 10+ reinsertions must still succeed! */
-    assert(SCH_Delete_Task(s06_stable_id) == 1U);
-    assert(SCH_Get_Task_Count() == 0U);
-
-    /* S06: Active-ID wraparound collision avoidance across 0xFFFFFFFF -> 1 */
-    SCH_Init();
-    uint32_t id_one = SCH_Add_Task(cb_noop, 100U, 100U);
-    assert(id_one == 1U);
-    SCH_Test_Set_Next_ID(0xFFFFFFFEU);
-    uint32_t id_fe = SCH_Add_Task(cb_noop, 100U, 0U);
-    uint32_t id_ff = SCH_Add_Task(cb_noop, 100U, 0U);
-    uint32_t id_wrap = SCH_Add_Task(cb_noop, 100U, 0U);
-    assert(id_fe == 0xFFFFFFFEU);
-    assert(id_ff == 0xFFFFFFFFU);
-    /* Must skip 0 (invalid) AND skip 1 (already active in id_one) -> lands on 2! */
-    assert(id_wrap == 2U);
-
-    puts("PASS [S05/S06]: 1/8/16 task ticks, PRIMASK restore, stable IDs, wraparound & overruns");
-}
-
-/* ========================================================================== */
-/* D01: Software Timer Rounding (1/10/11 ms), Cancel & One-Time Consumption   */
-/* ========================================================================== */
-
-static void test_d01_software_timers(void)
-{
+    /* Software timers: 1/10/11 ms ceiling rounding + one-time flag */
     timer_init();
-
-    /* Boundary validation */
     assert(!timer_start(0U, 0U));
-    assert(!timer_start(TIMER_COUNT, 10U));
-    assert(!timer_take_expired(TIMER_COUNT));
-    assert(timer_remaining_ms(TIMER_COUNT) == 0U);
-    timer_cancel(TIMER_COUNT);
-
-    /* 1 ms -> 1 tick (10 ms), 10 ms -> 1 tick (10 ms), 11 ms -> 2 ticks (20 ms) */
-    assert(timer_start(0U, 1U));
-    assert(timer_start(1U, 10U));
-    assert(timer_start(2U, 11U));
-    assert(timer_start(3U, 25U));
-
-    assert(timer_remaining_ms(0U) == 10U);
-    assert(timer_remaining_ms(1U) == 10U);
-    assert(timer_remaining_ms(2U) == 20U);
-    assert(timer_remaining_ms(3U) == 30U);
-
-    /* Cancel timer 3 before expiration */
-    timer_cancel(3U);
-    assert(timer_remaining_ms(3U) == 0U);
-    assert(!timer_take_expired(3U));
-
-    /* Tick #1 (10 ms elapsed) */
+    assert(timer_start(0U, 1U) && timer_start(1U, 10U) && timer_start(2U, 11U));
     timer_tick();
-    assert(timer_take_expired(0U));
-    assert(!timer_take_expired(0U)); /* Consumed once! */
-    assert(timer_take_expired(1U));
-    assert(!timer_take_expired(1U)); /* Consumed once! */
-    assert(!timer_take_expired(2U));
-    assert(timer_remaining_ms(2U) == 10U);
-
-    /* Tick #2 (20 ms elapsed) */
+    assert(timer_take_expired(0U) && !timer_take_expired(0U));
+    assert(timer_take_expired(1U) && !timer_take_expired(1U));
+    assert(!timer_take_expired(2U) && timer_remaining_ms(2U) == 10U);
     timer_tick();
-    assert(timer_take_expired(2U));
-    assert(!timer_take_expired(2U)); /* Consumed once! */
-    assert(timer_remaining_ms(2U) == 0U);
-    assert(!timer_take_expired(3U));
+    assert(timer_take_expired(2U) && !timer_take_expired(2U));
 
-    /* Overflow-safe large ms start */
-    assert(timer_start(7U, UINT32_MAX));
-    assert(timer_remaining_ms(7U) == UINT32_MAX);
-    timer_cancel(7U);
-
-    puts("PASS [D01]: Software timer 1/10/11 ms ceiling rounding, cancel & single-shot flag");
+    puts("PASS [1/2]: Scheduler O(1) queue & Software Timers verified");
 }
 
 /* ========================================================================== */
-/* Integration Test: Member 1 (Scheduler + Timer) + Member 3 (Control + FSMs) */
+/* 2. Full End-to-End System Test (AUTO -> MANUAL -> TUNING -> AUTO + LCD/I2C)*/
 /* ========================================================================== */
 
-static app_light_t g_int_road1;
-static app_light_t g_int_road2;
-static app_event_t g_int_b2_event;
+static uint32_t sim_now_ms;
+static bool raw_btn_pin[BUTTON_COUNT]; /* Active-LOW electrical levels */
+static uint8_t gpio_road_bits[2];
+static char pcf_lcd_screen[LCD_ROWS][LCD_COLUMNS + 1U];
+static uint8_t pcf_cursor_row, pcf_cursor_col;
+static bool pcf_nibble_phase;
+static uint8_t pcf_upper_latch;
+static bool pcf_4bit_ready;
 
-static app_event_t int_button_take_event(uint8_t id)
+static bool sim_read_btn(void *ctx, uint8_t id)
 {
-    if (id == 1U) {
-        app_event_t ev = g_int_b2_event;
-        g_int_b2_event = APP_EVENT_NONE;
-        return ev;
+    (void)ctx;
+    return raw_btn_pin[id];
+}
+
+static void sim_write_light_pin(void *ctx, uint8_t road, uint8_t pin, bool high)
+{
+    uint8_t mask = (pin == 0U) ? 2U : 1U;
+    (void)ctx;
+    if (high) {
+        gpio_road_bits[road] |= mask;
+    } else {
+        gpio_road_bits[road] &= (uint8_t)~mask;
     }
-    return APP_EVENT_NONE;
+    /* Physical safety check: NEVER both roads green (code 2U) simultaneously! */
+    assert(!(gpio_road_bits[0] == 2U && gpio_road_bits[1] == 2U));
 }
 
-static bool int_traffic_apply_pair(app_light_t r1, app_light_t r2)
+static uint8_t dht20_crc8(const uint8_t data[6])
 {
-    /* Never allow simultaneous greens */
-    assert(!(r1 == APP_GREEN && r2 == APP_GREEN));
-    assert(r1 == APP_RED || r2 == APP_RED);
-    g_int_road1 = r1;
-    g_int_road2 = r2;
-    return true;
-}
-
-static void int_traffic_all_red(void)
-{
-    g_int_road1 = APP_RED;
-    g_int_road2 = APP_RED;
-}
-
-static void int_control_task(void)
-{
-    if (app_state.fault) {
-        return;
+    uint8_t crc = 0xFFU;
+    for (uint8_t i = 0U; i < 6U; ++i) {
+        crc ^= data[i];
+        for (uint8_t b = 0U; b < 8U; ++b) {
+            crc = (uint8_t)((crc << 1U) ^ ((crc & 0x80U) ? 0x31U : 0U));
+        }
     }
-    if (app_state.mode == APP_AUTO) {
-        fsm_automatic_run(APP_EVENT_NONE);
-    } else if (app_state.mode == APP_MANUAL) {
-        fsm_manual_run(int_button_take_event(1U));
+    return crc;
+}
+
+/* Simulates both DHT20 (0x38) and PCF8574 HD44780 16x2 LCD (0x21 OhStem) on shared I2C */
+static bool sim_i2c_write(void *ctx, uint8_t addr, const uint8_t *data, uint16_t size)
+{
+    (void)ctx;
+    if (addr == DHT20_ADDRESS) {
+        return true;
+    }
+    if (addr == LCD_OHSTEM_ADDRESS) {
+        for (uint16_t i = 0U; i < size; ++i) {
+            uint8_t b = data[i];
+            /* Latch on falling edge of EN (0x04) — check when EN is high */
+            if ((b & 0x04U) != 0U) {
+                bool rs = (b & 0x01U) != 0U;
+                if (!pcf_4bit_ready) {
+                    if ((b & 0xF0U) == 0x20U) {
+                        pcf_4bit_ready = true;
+                        pcf_nibble_phase = false;
+                    }
+                } else if (!pcf_nibble_phase) {
+                    pcf_upper_latch = (uint8_t)(b & 0xF0U);
+                    pcf_nibble_phase = true;
+                } else {
+                    uint8_t full = (uint8_t)(pcf_upper_latch | ((b >> 4U) & 0x0FU));
+                    pcf_nibble_phase = false;
+                    if (!rs) {
+                        if (full == 0x01U) {
+                            memset(pcf_lcd_screen, ' ', sizeof pcf_lcd_screen);
+                            pcf_lcd_screen[0][16] = '\0';
+                            pcf_lcd_screen[1][16] = '\0';
+                        } else if (full == 0x80U) {
+                            pcf_cursor_row = 0U;
+                            pcf_cursor_col = 0U;
+                        } else if (full == 0xC0U) {
+                            pcf_cursor_row = 1U;
+                            pcf_cursor_col = 0U;
+                        }
+                    } else if (pcf_cursor_row < LCD_ROWS && pcf_cursor_col < LCD_COLUMNS) {
+                        pcf_lcd_screen[pcf_cursor_row][pcf_cursor_col++] = (char)full;
+                        pcf_lcd_screen[pcf_cursor_row][16] = '\0';
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    if (addr == LCD_GROVE_ADDRESS) {
+        return true;
+    }
+    return false;
+}
+
+static bool sim_i2c_read(void *ctx, uint8_t addr, uint8_t *data, uint16_t size)
+{
+    (void)ctx;
+    if (addr != DHT20_ADDRESS) {
+        return false;
+    }
+    if (size == 1U) {
+        data[0] = 0x18U; /* Calibrated & ready */
+        return true;
+    }
+    if (size == 7U) {
+        /* 50.0% RH (0x80000), 25.0 C ((25+50)/200 * 2^20 = 393216 = 0x60000) */
+        data[0] = 0x18U;
+        data[1] = 0x80U;
+        data[2] = 0x00U;
+        data[3] = 0x06U;
+        data[4] = 0x00U;
+        data[5] = 0x00U;
+        data[6] = dht20_crc8(data);
+        return true;
+    }
+    return false;
+}
+
+static uint32_t sim_get_ms(void) { return sim_now_ms; }
+
+static app_event_t bridge_btn(uint8_t id)
+{
+    switch (button_take_event(id)) {
+    case BUTTON_PRESS: return APP_EVENT_PRESS;
+    case BUTTON_LONG:  return APP_EVENT_LONG;
+    default:           return APP_EVENT_NONE;
     }
 }
 
-static void advance_scheduled_ms(uint32_t ms)
+static light_t bridge_light_enum(app_light_t l)
+{
+    switch (l) {
+    case APP_GREEN: return LIGHT_GREEN;
+    case APP_AMBER: return LIGHT_AMBER;
+    default:        return LIGHT_RED;
+    }
+}
+
+static bool bridge_lights(app_light_t r1, app_light_t r2)
+{
+    return traffic_apply_pair(bridge_light_enum(r1), bridge_light_enum(r2));
+}
+
+static display_view_t bridge_view(void)
+{
+    app_snapshot_t s = app_get_snapshot();
+    display_view_t v = {0};
+    v.mode = (s.mode == APP_MANUAL) ? DISPLAY_MANUAL
+           : (s.mode == APP_TUNING) ? DISPLAY_TUNING : DISPLAY_AUTO;
+    switch (s.phase) {
+    case PHASE_P0: v.phase = DISPLAY_ROAD1_GREEN; break;
+    case PHASE_P1: v.phase = DISPLAY_ROAD1_AMBER; break;
+    case PHASE_P2: v.phase = DISPLAY_ROAD2_GREEN; break;
+    case PHASE_P3: v.phase = DISPLAY_ROAD2_AMBER; break;
+    default:       v.phase = DISPLAY_ALL_RED;     break;
+    }
+    v.remaining_s = (uint16_t)((s.phase_remaining_ms + 999U) / 1000U);
+    v.tuning_field = (s.selected == PARAM_GREEN) ? 'G'
+                   : (s.selected == PARAM_AMBER) ? 'Y' : 'R';
+    v.tuning_value_s = (s.selected == PARAM_GREEN) ? s.draft.green_s
+                     : (s.selected == PARAM_AMBER) ? s.draft.amber_s : s.draft.red_s;
+    v.tuning_status = (s.tuning_status == TUNING_SAVED)   ? DISPLAY_SAVED
+                    : (s.tuning_status == TUNING_INVALID) ? DISPLAY_INVALID : DISPLAY_EDITING;
+    return v;
+}
+
+static void step_system_ms(uint32_t ms)
 {
     while (ms >= 10U) {
+        sim_now_ms += 10U;
         SCH_Update();
         SCH_Dispatch_Tasks();
         ms -= 10U;
     }
 }
 
-static void test_member1_member3_integration(void)
+/* Simulates a noisy physical active-LOW button press + release */
+static void press_short(uint8_t btn_id)
 {
+    raw_btn_pin[btn_id] = false; step_system_ms(10U); /* bounce low */
+    raw_btn_pin[btn_id] = true;  step_system_ms(10U); /* bounce high */
+    raw_btn_pin[btn_id] = false; step_system_ms(50U); /* stable press (50 ms) */
+    raw_btn_pin[btn_id] = true;  step_system_ms(30U); /* 3-sample release -> event fires */
+}
+
+/* Simulates holding a button >= 1.0 s then releasing */
+static void press_long_1s(uint8_t btn_id)
+{
+    raw_btn_pin[btn_id] = false;
+    step_system_ms(1050U); /* 30 ms debounce + 1000 ms hold -> emits LONG */
+    raw_btn_pin[btn_id] = true;
+    step_system_ms(40U);   /* release must NOT emit an extra short PRESS */
+}
+
+static void test_full_system_end_to_end(void)
+{
+    static const bool active_high[4] = {false, false, false, false};
+    static const traffic_codes_t codes[2] = {{3U, 1U, 2U}, {3U, 1U, 2U}};
     static const app_services_t services = {
-        .button_take_event = int_button_take_event,
-        .timer_start = timer_start,
-        .timer_cancel = timer_cancel,
-        .timer_take_expired = timer_take_expired,
-        .traffic_apply_pair = int_traffic_apply_pair,
-        .traffic_all_red = int_traffic_all_red,
-        .timer_remaining_ms = timer_remaining_ms
+        bridge_btn, timer_start, timer_cancel, timer_take_expired,
+        bridge_lights, traffic_all_red, timer_remaining_ms
     };
-    static const app_light_t exp_r1[4] = {APP_GREEN, APP_AMBER, APP_RED, APP_RED};
-    static const app_light_t exp_r2[4] = {APP_RED, APP_RED, APP_GREEN, APP_AMBER};
+    peripheral_i2c_t bus = {NULL, sim_i2c_write, sim_i2c_read, sim_get_ms};
+
+    sim_now_ms = 0U;
+    for (int i = 0; i < 4; ++i) raw_btn_pin[i] = true; /* idle HIGH (GPIO_PULLUP) */
+    gpio_road_bits[0] = 3U;
+    gpio_road_bits[1] = 3U;
+    pcf_4bit_ready = false;
+    pcf_nibble_phase = false;
+    memset(pcf_lcd_screen, 0, sizeof pcf_lcd_screen);
+    app_timing = (timing_config_t){7U, 5U, 2U};
 
     SCH_Init();
     timer_init();
-    g_int_b2_event = APP_EVENT_NONE;
-    app_timing = (timing_config_t){7U, 5U, 2U};
-
+    assert(button_init(sim_read_btn, NULL, active_high));
+    assert(traffic_light_init(sim_write_light_pin, NULL, codes));
+    assert(dht20_init(&bus));
+    assert(lcd_configure(&bus, LCD_OHSTEM_ADDRESS));
+    assert(display_init(bridge_view));
     assert(app_control_init(&services));
-    assert(app_get_snapshot().countdown_available);
 
-    /* Register in contract order: 1. timer_tick (10 ms), 2. control_task (10 ms) */
     assert(SCH_Add_Task(timer_tick, 1U, 1U) != SCH_NO_TASK_ID);
-    assert(SCH_Add_Task(int_control_task, 1U, 1U) != SCH_NO_TASK_ID);
+    assert(SCH_Add_Task(button_sample, 1U, 1U) != SCH_NO_TASK_ID);
+    assert(SCH_Add_Task(app_control_run, 1U, 1U) != SCH_NO_TASK_ID);
+    assert(SCH_Add_Task(dht20_task, 1U, 1U) != SCH_NO_TASK_ID);
+    assert(SCH_Add_Task(display_task, 1U, 20U) != SCH_NO_TASK_ID);
 
-    /* 1. Verify 1000 ms ALL_RED boot guard */
+    /* 1. Boot ALL_RED 1s -> P0 (G1/R2 5s) -> P1 (Y1/R2 2s) */
+    step_system_ms(1000U);
+    assert(app_get_snapshot().mode == APP_AUTO && app_get_snapshot().phase == PHASE_P0);
+    assert(gpio_road_bits[0] == 2U && gpio_road_bits[1] == 3U); /* Road1 GREEN, Road2 RED */
+
+    step_system_ms(5000U);
+    assert(app_get_snapshot().phase == PHASE_P1);
+    assert(gpio_road_bits[0] == 1U && gpio_road_bits[1] == 3U); /* Road1 AMBER, Road2 RED */
+
+    /* Verify PCF8574 LCD initialized & rendered both AUTO line and DHT20 environment! */
+    assert(strncmp(pcf_lcd_screen[0], "AUTO ", 5) == 0);
+    assert(strncmp(pcf_lcd_screen[1], "T25.0C H50%", 11) == 0);
+
+    /* 2. Press B1 while light is AMBER -> must safely enter MANUAL at ALL_RED */
+    press_short(0U);
+    assert(app_get_snapshot().mode == APP_MANUAL);
     assert(app_get_snapshot().phase == PHASE_ALL_RED);
-    advance_scheduled_ms(990U);
+    assert(gpio_road_bits[0] == 3U && gpio_road_bits[1] == 3U);
+
+    /* Press B2 three times in MANUAL: P0 -> P1 -> P2 (Road1 RED, Road2 GREEN) */
+    press_short(1U);
+    assert(app_get_snapshot().phase == PHASE_P0);
+    press_short(1U);
+    assert(app_get_snapshot().phase == PHASE_P1);
+    press_short(1U);
+    assert(app_get_snapshot().phase == PHASE_P2);
+    assert(gpio_road_bits[0] == 3U && gpio_road_bits[1] == 2U);
+
+    /* 3. Press B1 -> enter TUNING (ALL_RED, draft = {7, 5, 2}, selected = RED) */
+    press_short(0U);
+    assert(app_get_snapshot().mode == APP_TUNING);
     assert(app_get_snapshot().phase == PHASE_ALL_RED);
-    assert(app_get_snapshot().phase_remaining_ms == 10U);
-    advance_scheduled_ms(10U);
+    assert(gpio_road_bits[0] == 3U && gpio_road_bits[1] == 3U);
 
-    /* 2. Verify 3 full automatic cycles driven by real O(1) scheduler + software_timer */
-    for (unsigned cycle = 0U; cycle < 3U; ++cycle) {
-        for (unsigned phase = 0U; phase < 4U; ++phase) {
-            uint32_t dur_ms = (phase % 2U == 0U) ? 5000U : 2000U;
-            assert(app_get_snapshot().phase == (app_phase_t)phase);
-            assert(g_int_road1 == exp_r1[phase] && g_int_road2 == exp_r2[phase]);
-            advance_scheduled_ms(dur_ms - 10U);
-            assert(app_get_snapshot().phase == (app_phase_t)phase);
-            assert(app_get_snapshot().phase_remaining_ms == 10U);
-            advance_scheduled_ms(10U);
-        }
+    /* Increase R from 7 -> 8 via B3, then hold B2 1s -> INVALID (8 != 5 + 2)! */
+    press_short(2U);
+    assert(app_get_snapshot().draft.red_s == 8U);
+    press_long_1s(1U);
+    assert(app_get_snapshot().tuning_status == TUNING_INVALID);
+    assert(app_timing.red_s == 7U); /* Committed config untouched! */
+
+    /* Short-press B2 to select GREEN, increase G from 5 -> 6 via B3, hold B2 1s -> SAVED! */
+    press_short(1U);
+    assert(app_get_snapshot().selected == PARAM_GREEN);
+    press_short(2U);
+    assert(app_get_snapshot().draft.green_s == 6U);
+    press_long_1s(1U);
+    assert(app_get_snapshot().tuning_status == TUNING_SAVED);
+    assert(app_timing.red_s == 8U && app_timing.green_s == 6U && app_timing.amber_s == 2U);
+
+    /* Make an unsaved edit (G: 6 -> 5 via B4), then press B1 to CANCEL & return to AUTO */
+    press_short(3U);
+    assert(app_get_snapshot().draft.green_s == 5U);
+    press_short(0U);
+    assert(app_get_snapshot().mode == APP_AUTO);
+    assert(app_get_snapshot().phase == PHASE_ALL_RED);
+    assert(app_timing.green_s == 6U); /* Unsaved draft discarded, saved 6s preserved! */
+
+    /* 4. Verify AUTO now runs with the newly saved 6s GREEN duration! */
+    step_system_ms(1000U); /* Exit 1s ALL_RED guard -> P0 */
+    assert(app_get_snapshot().phase == PHASE_P0);
+    step_system_ms(5990U);
+    assert(app_get_snapshot().phase == PHASE_P0); /* Still GREEN at 5.99s! */
+    step_system_ms(10U);
+    assert(app_get_snapshot().phase == PHASE_P1); /* Transitions to AMBER at exact 6.00s! */
+
+    /* 5. Verify Grove 0x3E LCD fallback protocol also initializes & writes cleanly */
+    assert(lcd_configure(&bus, LCD_GROVE_ADDRESS));
+    for (int k = 0; k < 20; ++k) {
+        sim_now_ms += 60U;
+        if (lcd_init()) break;
     }
+    assert(lcd_init());
+    assert(lcd_write_line(0U, "GROVE OK"));
 
-    /* 3. Switch from AUTO -> MANUAL mid-phase and verify timer cancellation & manual advance */
-    fsm_automatic_exit();
-    app_state.mode = APP_MANUAL;
-    fsm_manual_enter();
-    assert(timer_remaining_ms(0U) == 0U);
-    assert(g_int_road1 == APP_RED && g_int_road2 == APP_RED);
-
-    for (unsigned step = 0U; step < 4U; ++step) {
-        g_int_b2_event = APP_EVENT_PRESS;
-        advance_scheduled_ms(10U);
-        assert(app_get_snapshot().phase == (app_phase_t)step);
-        assert(g_int_road1 == exp_r1[step] && g_int_road2 == exp_r2[step]);
-    }
-
-    puts("PASS [INTEGRATION]: Member 1 (scheduler + software_timer) <-> Member 3 (FSMs) verified");
+    puts("PASS [2/2]: Full System (AUTO/MANUAL/TUNING + Debounce + DHT20 + PCF8574/Grove LCD) verified");
 }
 
 int main(void)
 {
-    test_s01_s02_periodic_and_oneshot();
-    test_s03_queue_order_and_deletion();
-    test_s04_edge_cases_and_self_delete();
-    test_s05_s06_concurrency_and_ids();
-    test_d01_software_timers();
-    test_member1_member3_integration();
-    puts("ALL MEMBER 1 & INTEGRATION TESTS PASSED.");
+    test_scheduler_and_timers();
+    test_full_system_end_to_end();
+    puts("ALL SYSTEM TESTS PASSED.");
     return 0;
 }

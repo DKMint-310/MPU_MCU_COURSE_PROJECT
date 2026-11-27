@@ -14,5 +14,6 @@ typedef struct {
 } app_services_t;
 
 bool app_control_init(const app_services_t *services);
+void app_control_run(void);
 app_snapshot_t app_get_snapshot(void);
 #endif

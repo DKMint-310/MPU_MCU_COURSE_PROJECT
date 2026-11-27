@@ -1,5 +1,7 @@
 #include "app_internal.h"
 #include "fsm_automatic.h"
+#include "fsm_manual.h"
+#include "fsm_tuning.h"
 #include <stddef.h>
 
 static app_services_t io;
@@ -40,7 +42,6 @@ void app_set_phase(app_phase_t phase)
 }
 bool app_control_init(const app_services_t *services)
 {
-
     if (initialized) { app_timer_cancel(); io.traffic_all_red(); }
     initialized = false;
     if (services == NULL || services->button_take_event == NULL
@@ -58,6 +59,65 @@ bool app_control_init(const app_services_t *services)
     fsm_automatic_enter();
     return !app_state.fault;
 }
+
+void app_control_run(void)
+{
+    app_event_t b1, b2, b3, b4;
+
+    if (!initialized) {
+        return;
+    }
+
+    /* Consume button events once per 10 ms control tick */
+    b1 = io.button_take_event(0U);
+    b2 = io.button_take_event(1U);
+    b3 = io.button_take_event(2U);
+    b4 = io.button_take_event(3U);
+
+    /* B1 has highest priority: switch AUTO -> MANUAL -> TUNING -> AUTO */
+    if (b1 == APP_EVENT_PRESS) {
+        app_state.fault = false;
+        switch (app_state.mode) {
+        case APP_AUTO:
+            fsm_automatic_exit();
+            app_state.mode = APP_MANUAL;
+            fsm_manual_enter();
+            break;
+        case APP_MANUAL:
+            fsm_manual_exit();
+            app_state.mode = APP_TUNING;
+            fsm_tuning_enter();
+            break;
+        case APP_TUNING:
+        default:
+            fsm_tuning_exit();
+            app_state.mode = APP_AUTO;
+            fsm_automatic_enter();
+            break;
+        }
+        return;
+    }
+
+    if (app_state.fault) {
+        return;
+    }
+
+    switch (app_state.mode) {
+    case APP_AUTO:
+        fsm_automatic_run(APP_EVENT_NONE);
+        break;
+    case APP_MANUAL:
+        fsm_manual_run(b2);
+        break;
+    case APP_TUNING:
+        fsm_tuning_run(b2, b3, b4);
+        break;
+    default:
+        app_fail_safe();
+        break;
+    }
+}
+
 app_snapshot_t app_get_snapshot(void)
 {
     app_snapshot_t result = app_state;
