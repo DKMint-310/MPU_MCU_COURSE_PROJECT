@@ -1,4 +1,5 @@
 Debug/
+docs/
 Release/
 *.o
 *.d
